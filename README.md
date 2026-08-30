@@ -12,13 +12,13 @@ parse(text) match
 
 ```
 dependencies {
-  yaml { git = "github.com/sysl-lang/yaml", version = "0.1.0" }
+  yaml { git = "github.com/sysl-lang/yaml", version = "0.1.1" }
 }
 ```
 
 The coordinate names the package, `yaml`; the module a program imports is `sh.sysl.yaml`.
 
-## Installing libyaml, and the one flag this package needs today
+## Installing libyaml
 
 libyaml is not vendored — it is a hosted C library every platform packages:
 
@@ -28,19 +28,21 @@ apt install libyaml-dev
 pacman -S libyaml
 ```
 
-**Building against it needs two flags for the moment**, and it is a compiler restriction rather than
-anything about this package. A manifest declares an installed library under the name `pkg-config`
-files it as, and libyaml files as **`yaml-0.1`** — a name sysl refuses today, because a `pkg_config`
-key must also be usable as a `--include-path` name and that check does not allow a dot. So the
-manifest declares a `headers` requirement instead, and a build says where libyaml is:
+That is the whole of it. The manifest declares the library under the name `pkg-config` files it as,
+sysl asks `pkg-config` where its headers and link line are, and a build needs no flags:
 
 ```
-sysl test . --include-path yaml=$(pkg-config --variable=includedir yaml-0.1) \
-            --link-path $(pkg-config --variable=libdir yaml-0.1)
+sysl test .
 ```
 
-That is filed as card `0380`. When it lands, the manifest becomes an ordinary `pkg_config` block, the
-flags go away, and this package re-tags.
+**It needed two flags until sysl 0.0.94**, and that is why this package's floor is where it is. A
+`pkg_config` key used to be checked by the same rule as a `headers` name, which allowed letters,
+digits, `_` and `-` and no dot — and libyaml files as **`yaml-0.1`**, which is not a name this
+package chose. So the requirement had to be declared as a header one and every build handed
+libyaml's two directories on the command line. Card `0380` gave a `.pc` name a rule of its own.
+
+The name is **quoted** in the manifest because it holds a dot, and an unquoted dot is HOCON's path
+separator.
 
 ## What it is
 

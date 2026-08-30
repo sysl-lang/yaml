@@ -8,18 +8,22 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       yaml { git = "github.com/sysl-lang/yaml", version = "0.1.0" }
+//       yaml { git = "github.com/sysl-lang/yaml", version = "0.1.1" }
 //     }
 //
 // The coordinate names the package, `yaml`; the module a program imports is `sh.sysl.yaml`.
 
 package {
   name    = "yaml"
-  version = "0.1.0"
+  version = "0.1.1"
 
   // The oldest compiler this was written and tested against, rather than a bisected minimum. `c
   // const` over `sizeof`, `opaque struct`, `@link` and `@include` are all much older than this.
-  sysl = "0.0.93"
+  //
+  // **0.0.94 is a real floor rather than the day's release**, and it is the `pkg_config` block
+  // below: card `0380` is what let a `.pc` name hold a dot, and libyaml files as `yaml-0.1`. An
+  // older compiler refuses this manifest outright.
+  sysl = "0.0.94"
 }
 
 // **`heap`, because a document's size is not known until it has been read.** A mapping is a
@@ -33,27 +37,24 @@ package {
 // **What is NOT here is `os`.** This package neither opens nor reads a file: `parse` is given text
 // the caller already has. Where the document came from is the program's business.
 //
-// **THIS SHOULD BE A `pkg_config` BLOCK AND CANNOT BE ONE YET, WHICH IS CARD `0380`.** Nothing is
-// vendored — libyaml is a hosted C library with its own build system and every platform packages it
-// — so a consumer has to have it installed, and a `pkg_config` requirement is how every other
-// installed-library binding in the org says so once and builds with the bare command.
+// **`pkg_config`, because nothing is vendored.** libyaml is a hosted C library with its own build
+// system and every platform packages it, so a consumer has to have it installed and this is how
+// every other installed-library binding in the org says so once. sysl asks `pkg-config` where the
+// headers and the link line are, and a build needs no flags at all.
 //
-// libyaml files as **`yaml-0.1`**, and sysl refuses that name: a `pkg_config` key is checked by the
-// same rule as a `headers` name, which allows letters, digits, `_` and `-` and no dot. The name is
-// not this package's to choose — it is what `pkg-config` answers to, on macOS, Debian and Arch
-// alike — so until the card lands the requirement is declared as a header one and a build is handed
-// libyaml's two directories:
+// **The name is quoted because it holds a dot, and an unquoted dot is HOCON's path separator** --
+// `yaml-0.1 = "..."` would declare a `1` inside a `yaml-0`. The name is not this package's to
+// choose either way: it is what `pkg-config` answers to, on macOS, Debian and Arch alike.
 //
-//     sysl test . --include-path yaml=$(pkg-config --variable=includedir yaml-0.1) \
-//                 --link-path $(pkg-config --variable=libdir yaml-0.1)
-//
-// When `0380` lands this becomes `pkg_config { "yaml-0.1" = ... }`, the flags go away, and the
-// package re-tags.
+// It was a `headers { yaml = ... }` requirement until 0.0.94, because a `pkg_config` key was
+// checked by the same rule as a `headers` name and that rule allowed no dot -- so every build had
+// to be handed libyaml's two directories on the command line. Card `0380` fixed it; the flags are
+// gone and `sysl test .` is the whole command.
 requires {
   heap  = true
   posix = true
 
-  headers {
-    yaml = "libyaml — `brew install libyaml` on macOS, Debian's libyaml-dev, Arch's libyaml"
+  pkg_config {
+    "yaml-0.1" = "libyaml — `brew install libyaml` on macOS, Debian's libyaml-dev, Arch's libyaml"
   }
 }
