@@ -1,0 +1,399 @@
+module sh.sysl.yaml
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{parse_long_base, parse_real, Search}
+
+// A document read into a `Value`: the event loop, the anchor table, and the schema that decides what
+// a plain scalar means.
+//
+// **Three decisions are made here and each one is a decision somebody else's YAML reader makes
+// differently**, so each is written down in the README as well:
+//
+//   - **A plain scalar resolves by the YAML 1.2 core schema.** `true` and `false` are booleans;
+//     `yes`, `no`, `on` and `off` are strings. 1.1 tools disagree, which is why it is said out loud.
+//   - **An alias binds the value its anchor named**, and a document that expands to more than
+//     `Limits.max_nodes` nodes is refused rather than read.
+//   - **A `<<` merge key is an ordinary key.** Folding it would make a key the caller can see
+//     disappear into the mapping around it.
+
+/** What a document may cost before it is refused.
+ *
+ * **Both bounds exist because a YAML document is not the size of its text.** An alias names a node
+ * that has already been read, so `&a [x, x]` followed by nine mappings of aliases is a few hundred
+ * bytes describing a billion nodes — the "billion laughs" shape, and the reason every YAML reader
+ * that has been attacked has grown a limit like this one.
+ *
+ * **What is counted is the *expanded* size, not the text.** Aliases share their storage here rather
+ * than being copied, so the bomb costs nothing in memory; what it costs is every later walk over the
+ * tree, which is the caller's loop and out of this package's reach. So the count is charged where it
+ * can be: an alias is charged the whole size of the node it names.
+ */
+struct Limits
+    max_nodes: usize
+    max_depth: usize
+
+/** A million nodes and a thousand deep, which is far past any configuration file and far short of
+ * anything that takes a noticeable time to refuse.
+ */
+default_limits() -> Limits = Limits(1000000, 1000)
+
+/** An anchor, what it named, and how big that was. The size is kept so that resolving an alias can
+ * charge the budget without walking the value.
+ */
+private struct Anchor
+    name: string
+    value: Value
+    nodes: usize
+
+/** The state of one load: where the events come from, what the anchors named, and what has been
+ * spent.
+ */
+private struct Loader
+    p: &Parser
+    anchors: Buf[Anchor]
+    nodes: usize
+    limits: Limits
+
+    /** One more node, or the budget. */
+    private charge(*self, n: usize) -> Result[unit, Error]
+        self.nodes += n
+
+        if self.nodes > self.limits.max_nodes then
+            Err(TooLarge(self.limits.max_nodes))
+        else
+            Ok(())
+
+    private bind(*self, anchor: Option[string], v: Value, size: usize)
+        anchor match
+            Some(name) -> self.anchors.push(Anchor(name, v, size))
+            None -> ()
+
+    /** What an anchor named, most recent first — a document may reuse an anchor name, and the
+     * nearest binding is the one an alias means.
+     */
+    private lookup(*self, name: string, at: Mark) -> Result[Value, Error]
+        var i = self.anchors.len()
+
+        while i > 0
+            i -= 1
+
+            val a = self.anchors.at(i)
+
+            if a.name == name
+                self.charge(a.nodes)?
+                return Ok(a.value)
+
+        Err(UnknownAlias(name, at))
+    end lookup
+
+    /** The node this event begins, with everything it contains.
+     *
+     * **`l` is the node's first event, already read.** A YAML node is told from the event that opens
+     * it, so the caller pulls one and hands it over rather than this looking ahead.
+     */
+    private node(*self, l: Located, depth: usize) -> Result[Value, Error]
+        if depth > self.limits.max_depth then return Err(TooDeep(self.limits.max_depth))
+
+        val before = self.nodes
+
+        self.charge(1)?
+
+        l.event match
+            Scalar(value, anchor, tag, style, plain, _) ->
+                val v = resolve(value, tag, style, plain)
+
+                self.bind(anchor, v, self.nodes - before)
+                Ok(v)
+
+            Alias(name) -> self.lookup(name, l.start)
+
+            SequenceStart(anchor, _, _, _) ->
+                var items: Buf[Value] = buf()
+
+                loop
+                    val nx = self.p.next()?
+
+                    nx.event match
+                        SequenceEnd -> break
+                        _ -> items.push(self.node(nx, depth + 1)?)
+
+                val v = Seq(items)
+
+                self.bind(anchor, v, self.nodes - before)
+                Ok(v)
+
+            MappingStart(anchor, _, _, _) ->
+                var entries: Buf[Entry] = buf()
+
+                loop
+                    val nx = self.p.next()?
+
+                    nx.event match
+                        MappingEnd -> break
+                        _ ->
+                            val k = self.node(nx, depth + 1)?
+                            val v = self.node(self.p.next()?, depth + 1)?
+
+                            entries.push(Entry(k, v))
+
+                val v = Map(entries)
+
+                self.bind(anchor, v, self.nodes - before)
+                Ok(v)
+
+            // **Every other event is unreachable and answering `Null` is deliberate.** libyaml's
+            // stream is well-formed by construction — a document's node is a scalar, a sequence, an
+            // alias or a mapping, and the ends are consumed by the loops above — so there is no
+            // input that reaches here and nothing for a diagnostic to say about one.
+            _ -> Ok(Null)
+    end node
+end Loader
+
+/** Every document in a stream, in order, under the default limits.
+ *
+ * A YAML file may hold several documents separated by `---`, which is what a Kubernetes manifest
+ * usually is. An empty stream answers an empty sequence of documents rather than an error.
+ */
+parse_all(text: string) -> Result[Buf[Value], Error] = parse_all_with(text, default_limits())
+
+/** The same, under limits of the caller's choosing. */
+parse_all_with(text: string, limits: Limits) -> Result[Buf[Value], Error]
+    val p = parser(text)?
+
+    var ld = Loader(p, buf(), 0, limits)
+    var docs: Buf[Value] = buf()
+
+    loop
+        val l = ld.p.next()?
+
+        l.event match
+            StreamEnd -> break
+
+            DocumentStart(_) ->
+                // **The anchor table is per document**, which is what the spec says: an anchor does
+                // not reach across a `---`.
+                ld.anchors.clear()
+                ld.nodes = 0
+
+                val first = ld.p.next()?
+
+                first.event match
+                    // An empty document — `---` with nothing after it — is the null node.
+                    DocumentEnd(_) -> docs.push(Null)
+                    _ ->
+                        docs.push(ld.node(first, 1)?)
+
+                        // The DOCUMENT-END that must follow the node.
+                        ld.p.next()?
+                        ()
+
+            _ -> ()
+
+    Ok(docs)
+end parse_all_with
+
+/** The one document a stream carries, under the default limits.
+ *
+ * **An empty stream is `Null`** — a file with nothing in it is a document with nothing in it, which
+ * is what every configuration reader means by one. **A stream carrying two documents is an error**
+ * rather than the first of them: a program expecting one configuration file should hear about the
+ * second `---` instead of silently ignoring it. `parse_all` is what reads those.
+ */
+parse(text: string) -> Result[Value, Error] = parse_with(text, default_limits())
+
+/** The same, under limits of the caller's choosing. */
+parse_with(text: string, limits: Limits) -> Result[Value, Error]
+    val docs = parse_all_with(text, limits)?
+
+    if docs.len() == 0 then
+        Ok(Null)
+    elif docs.len() == 1 then
+        Ok(docs.at(0))
+    else
+        Err(NotOneDocument(docs.len()))
+end parse_with
+
+// ## The schema
+//
+// What a scalar *means*, as against what it says. Three inputs decide it: the tag the document wrote
+// if it wrote one, the style it was written in, and the text.
+
+private const TAG_PREFIX: string = "tag:yaml.org,2002:"
+
+/** A scalar's value.
+ *
+ * **A written tag wins.** `!!str 123` is the three-character string and `!!int "7"` is the number
+ * seven, which is the whole point of writing one. A tag this package does not know — `!Foo` — leaves
+ * the value as its text, since a reader that has never heard of the type has nothing better to say
+ * about it than what was written.
+ *
+ * **Otherwise only a *plain* scalar resolves.** `null`, `true` and `42` in quotes, or written as a
+ * literal block, are strings: quoting is how a YAML document says "this is text", and a reader that
+ * ignored it would make it impossible to write the string `"null"` at all.
+ */
+private resolve(value: string, tag: Option[string], style: ScalarStyle, plain: bool) -> Value
+    tag match
+        Some(t) ->
+            if !t.starts_with(TAG_PREFIX) then return Str(value)
+
+            val kind = t[TAG_PREFIX.len..]
+
+            if kind == "null" then
+                Null
+            elif kind == "bool" then
+                as_bool_text(value).map((b) -> Bool(b)).unwrap_or(Str(value))
+            elif kind == "int" then
+                as_int_text(value).unwrap_or(Str(value))
+            elif kind == "float" then
+                as_float_text(value).unwrap_or(Str(value))
+            else
+                Str(value)
+
+        None ->
+            if !plain then return Str(value)
+
+            style match
+                Plain -> resolve_plain(value)
+                _ -> Str(value)
+end resolve
+
+/** The YAML 1.2 core schema, over a plain scalar.
+ *
+ * **`yes`, `no`, `on` and `off` are strings here**, which is 1.2's rule and not 1.1's. It is the one
+ * difference most likely to surprise somebody arriving from a 1.1 tool, and it is the safer of the
+ * two answers: a document meaning the boolean can write `true`, while a 1.1 reader gives a program
+ * no way at all to write the two-letter country code `NO`.
+ */
+private resolve_plain(value: string) -> Value
+    if value == "" || value == "~" || value == "null" || value == "Null" || value == "NULL" then
+        return Null
+
+    if value == "true" || value == "True" || value == "TRUE" then return Bool(true)
+    if value == "false" || value == "False" || value == "FALSE" then return Bool(false)
+
+    as_int_text(value) match
+        Some(v) -> return v
+        None -> ()
+
+    as_float_text(value).unwrap_or(Str(value))
+end resolve_plain
+
+private as_bool_text(s: string) -> Option[bool] =
+    if s == "true" || s == "True" || s == "TRUE" then
+        Some(true)
+    elif s == "false" || s == "False" || s == "FALSE" then
+        Some(false)
+    else
+        None
+
+/** The core schema's integer: a decimal with an optional sign, an `0o` octal, or an `0x` hex.
+ *
+ * **The scan is written out rather than handed to `parse_long`**, because the library's parser is
+ * more generous than the schema — it takes an underscore as a separator, which YAML 1.2 does not —
+ * and a reader that accepted `1_000` here would be reading a document by rules nothing wrote down.
+ */
+private as_int_text(s: string) -> Option[Value]
+    val b = s.bytes
+
+    if b.len == 0 then return None
+
+    if b.len > 2 && b[0] == u8('0') && b[1] == u8('o')
+        return digits_in(b[2..], 8).and_then((_) -> parse_long_base(s[2..], 8).ok()).map((n) -> Int(n))
+
+    if b.len > 2 && b[0] == u8('0') && b[1] == u8('x')
+        return digits_in(b[2..], 16).and_then((_) -> parse_long_base(s[2..], 16).ok()).map((n) -> Int(n))
+
+    var from: usize = if b[0] == u8('-') || b[0] == u8('+') then 1 else 0
+
+    if from >= b.len then return None
+
+    digits_in(b[from..], 10).and_then((_) -> parse_long_base(s, 10).ok()).map((n) -> Int(n))
+end as_int_text
+
+/** Whether every byte is a digit of this base, and there is at least one. */
+private digits_in(b: []const u8, base: usize) -> Option[unit]
+    if b.len == 0 then return None
+
+    for x in b
+        val d = if x >= u8('0') && x <= u8('9') then
+            usize(x - u8('0'))
+        elif x >= u8('a') && x <= u8('f') then
+            usize(x - u8('a')) + 10
+        elif x >= u8('A') && x <= u8('F') then
+            usize(x - u8('A')) + 10
+        else
+            99
+
+        if d >= base then return None
+
+    Some(())
+end digits_in
+
+/** The core schema's float, including the three spellings of infinity and the three of not-a-number.
+ *
+ * The exponent and fraction are checked here and the digits are handed to `parse_real`, which is
+ * where the rounding lives. `.5` and `5.` are both legal YAML and only one of them is legal C, so
+ * both are padded before they are parsed.
+ */
+private as_float_text(s: string) -> Option[Value]
+    if s == ".inf" || s == ".Inf" || s == ".INF" || s == "+.inf" || s == "+.Inf" || s == "+.INF" then
+        return Some(Real(1.0 / 0.0))
+
+    if s == "-.inf" || s == "-.Inf" || s == "-.INF" then return Some(Real(-1.0 / 0.0))
+
+    if s == ".nan" || s == ".NaN" || s == ".NAN" then return Some(Real(0.0 / 0.0))
+
+    val b = s.bytes
+
+    if b.len == 0 then return None
+
+    var i: usize = if b[0] == u8('-') || b[0] == u8('+') then 1 else 0
+
+    var whole: usize = 0
+
+    while i < b.len && b[i] >= u8('0') && b[i] <= u8('9')
+        i += 1
+        whole += 1
+
+    var frac: usize = 0
+
+    if i < b.len && b[i] == u8('.')
+        i += 1
+
+        while i < b.len && b[i] >= u8('0') && b[i] <= u8('9')
+            i += 1
+            frac += 1
+
+    // A number with no digits at all is not one, and a number with no dot and no exponent was the
+    // integer scanner's to take.
+    if whole + frac == 0 then return None
+
+    var exponent = false
+
+    if i < b.len && (b[i] == u8('e') || b[i] == u8('E'))
+        i += 1
+        exponent = true
+
+        if i < b.len && (b[i] == u8('-') || b[i] == u8('+')) then i += 1
+
+        var e: usize = 0
+
+        while i < b.len && b[i] >= u8('0') && b[i] <= u8('9')
+            i += 1
+            e += 1
+
+        if e == 0 then return None
+
+    if i != b.len then return None
+
+    // `.5` and `5.` are the two shapes the C parser underneath will not take.
+    var text = s
+
+    if b[0] == u8('.') then text = s"0${s}"
+    elif b.len > 1 && (b[0] == u8('-') || b[0] == u8('+')) && b[1] == u8('.') then
+        text = s"${s[0..<1]}0${s[1..]}"
+
+    if !exponent && frac == 0 && text.bytes[text.bytes.len - 1] == u8('.') then text = s"${text}0"
+
+    parse_real(text).ok().map((x) -> Real(x))
+end as_float_text

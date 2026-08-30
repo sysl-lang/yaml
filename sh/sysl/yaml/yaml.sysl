@@ -1,0 +1,334 @@
+module sh.sysl.yaml
+
+import sh.sysl.yaml.c
+import sysl.slices.as_ptr
+import sysl.text.{from_cstring, from_utf8}
+
+// YAML, bound to libyaml.
+//
+// **There are two tiers here and a program may want either.** `parse` reads a document into a
+// `Value` that owns itself, which is what a program handed an OpenAPI specification or a Kubernetes
+// manifest wants; `Parser` hands over libyaml's events one at a time, which is what a program
+// streaming a large document, or one that cares about anchors as anchors, wants instead. The first
+// is written in terms of the second and there is nothing in it a caller could not have written.
+//
+//     import sh.sysl.yaml.{parse, describe}
+//
+//     main() -> Result[unit, string]
+//         val doc = parse(text).map_err(describe)?
+//
+//         doc.get("kind").and_then(as_str) match
+//             Some(k) -> print("kind:", k)
+//             None -> print("no kind")
+//
+// **libyaml is a pull parser, which is why this binding has almost no C in it.** There is no
+// callback anywhere: `yaml_parser_parse` answers one event and returns, so the loop belongs to the
+// caller and nothing has to find its way back into sysl. What C there is — `c/shim.c` — is one
+// function flattening the union inside `yaml_event_t`, which is the one shape sysl cannot spell.
+//
+// **A scalar is copied out of libyaml's storage as it arrives.** The alternative is a view valid
+// only until the next event, which would be a trap in a language where a `string` outlives the call
+// that made it, and every value ends up in a `Buf` anyway.
+
+// ## Where something is
+//
+// Both are zero-based, which is libyaml's convention and not a person's: a diagnostic that quotes
+// them adds one.
+
+/** A place in the document. */
+struct Mark
+    line: usize
+    column: usize
+
+// ## What can go wrong
+
+/** Which stage of libyaml refused.
+ *
+ * It is worth telling apart because the three fail at different distances from the caller's
+ * mistake: a `Reader` failure is bytes that are not the encoding they claim, a `Scanner` failure is
+ * a token that cannot be read at all, and a `Parser` failure is a well-formed token in a place the
+ * grammar has no production for.
+ */
+enum Stage
+    Reader
+    Scanner
+    Parser
+    Composer
+    Memory
+    Unknown
+
+/** What went wrong, reading a document. */
+enum Error
+    /** libyaml refused the document: its own sentence, where it stopped, and — usually — what it
+     * was in the middle of when it gave up, which is the half that says where to look.
+     */
+    Syntax(problem: string, at: Mark, context: Option[string], context_at: Mark, stage: Stage)
+
+    /** A scalar, an anchor or a tag whose bytes are not UTF-8, at this place. libyaml checks the
+     * document's encoding and this binding checks every string it copies out, because a `string` is
+     * validated UTF-8 and a document is not obliged to be.
+     */
+    NotUtf8(at: Mark)
+
+    /** libyaml could not allocate. */
+    OutOfMemory
+
+    /** An `*alias` naming an anchor no `&anchor` had introduced. libyaml reports this itself for a
+     * document it loads; the tree built here resolves aliases on its own, so it reports its own.
+     */
+    UnknownAlias(anchor: string, at: Mark)
+
+    /** The tree outgrew `Limits.max_nodes`. **An alias is resolved by copying**, so a document of a
+     * few hundred bytes can name a tree of billions of nodes — the "billion laughs" shape — and the
+     * budget is what turns that into an answer rather than a machine that stops responding.
+     */
+    TooLarge(limit: usize)
+
+    /** The tree nested deeper than `Limits.max_depth`. Bounds the reader's own recursion, which has
+     * the machine's stack under it and no error to report once that is gone.
+     */
+    TooDeep(limit: usize)
+
+    /** `parse` was given a stream carrying more than one document. `parse_all` is what reads one of
+     * those, and it is a separate function because a program that expects one configuration file
+     * should hear about a second `---` rather than silently read the first.
+     */
+    NotOneDocument(count: usize)
+end Error
+
+/** One line saying what went wrong, for a program that has nowhere better to put it. */
+describe(e: Error) -> string = e match
+    Syntax(problem, at, context, _, _) -> context match
+        Some(c) -> s"${problem} ${c} (line ${at.line + 1}, column ${at.column + 1})"
+        None -> s"${problem} (line ${at.line + 1}, column ${at.column + 1})"
+    NotUtf8(at) -> s"a scalar that is not UTF-8, at line ${at.line + 1}"
+    OutOfMemory -> "out of memory"
+    UnknownAlias(a, at) -> s"the alias '*${a}' names an anchor that has not been defined, at line ${at.line + 1}"
+    TooLarge(n) -> s"the document expands to more than ${n} nodes"
+    TooDeep(n) -> s"the document nests deeper than ${n}"
+    NotOneDocument(n) -> s"the stream carries ${n} documents, not one"
+
+// ## How a scalar was written
+//
+// **It is a fact about the document rather than about the value**, and it matters for exactly one
+// reason: only a *plain* scalar is a candidate for the schema's `null`, `true` and numbers. `"null"`
+// in quotes is the four-letter string and nothing else, which is how a YAML document says so.
+
+enum ScalarStyle
+    Plain
+    SingleQuoted
+    DoubleQuoted
+    Literal
+    Folded
+
+/** Whether a collection was written `a: [1, 2]` or as an indented block. Carried because a program
+ * re-rendering a document wants it; nothing here reads it.
+ */
+enum CollectionStyle
+    Block
+    Flow
+
+// ## The events
+//
+// libyaml's own sequence, which is the YAML spec's: a stream contains documents, a document contains
+// one node, and a node is a scalar, a sequence or a mapping. A mapping's contents alternate key and
+// value with nothing marking which is which, so a reader counts.
+
+/** One event out of the parser. */
+enum Event
+    StreamStart
+    StreamEnd
+
+    /** `explicit` is whether the document opened with `---`. */
+    DocumentStart(explicit: bool)
+
+    /** `explicit` is whether the document closed with `...`. */
+    DocumentEnd(explicit: bool)
+
+    /** `*name`, unresolved. The document model resolves these; this tier does not, so a program that
+     * cares about the graph can see it.
+     */
+    Alias(anchor: string)
+
+    /** A scalar, with everything the document said about it.
+     *
+     * `plain_implicit` and `quoted_implicit` are libyaml's two flags for "the tag was not written":
+     * the first for a plain scalar, the second for every other style. A scalar with neither set and
+     * no `tag` is one libyaml resolved itself.
+     */
+    Scalar(value: string, anchor: Option[string], tag: Option[string], style: ScalarStyle,
+           plain_implicit: bool, quoted_implicit: bool)
+
+    /** `implicit` is whether the tag was left to be worked out rather than written. */
+    SequenceStart(anchor: Option[string], tag: Option[string], style: CollectionStyle, implicit: bool)
+    SequenceEnd
+
+    MappingStart(anchor: Option[string], tag: Option[string], style: CollectionStyle, implicit: bool)
+    MappingEnd
+end Event
+
+/** An event and the span of document it came from. */
+struct Located
+    event: Event
+    start: Mark
+    end: Mark
+
+// ## The parser
+
+/** A document being read, one event at a time.
+ *
+ * **It is reached only through `&Parser` and that is not a style choice.** libyaml's parser holds
+ * pointers into buffers it allocated, so the struct may not be copied while it is in use — a `&T`
+ * box does not move, which is what makes placing the C state in a field of one safe. It is also
+ * what makes the destructor run at all: a `Drop` fires when a box's count reaches zero and for
+ * nothing else.
+ *
+ * **The document's text is held here too**, because libyaml reads out of the caller's bytes rather
+ * than copying them. Holding the `string` in the same box as the storage is what makes the input
+ * outlive the parser by construction instead of by a rule somebody has to remember.
+ */
+struct Parser
+    private src: string
+    private storage: [c.READER_WORDS]u64
+    private ended: bool
+
+    private raw(*self) -> *c.Reader = ptr_cast(&self.storage[0])
+
+    /** Whether the stream has ended. `next` answers `StreamEnd` for ever once it has. */
+    at_end(*self) -> bool = self.ended
+
+    /** The next event, or the first thing wrong with the document.
+     *
+     * **After `StreamEnd` this keeps answering `StreamEnd`.** libyaml refuses to be asked again and
+     * a binding that passed that refusal on would turn a loop written one line differently into an
+     * error about something the caller did not do.
+     */
+    next(*self) -> Result[Located, Error]
+        if self.ended then return Ok(Located(StreamEnd, Mark(0, 0), Mark(0, 0)))
+
+        var e = c.Event(0, 0, 0, 0, null, null, null, 0, 0, 0, 0, 0)
+
+        if c.reader_next(self.raw(), &e) == 0 then return Err(self.failure())
+
+        val start = Mark(e.start_line, e.start_column)
+        val fin = Mark(e.end_line, e.end_column)
+
+        val ev = if e.kind == c.STREAM_START_EVENT then
+            StreamStart
+        elif e.kind == c.STREAM_END_EVENT then
+            self.ended = true
+            StreamEnd
+        elif e.kind == c.DOCUMENT_START_EVENT then
+            DocumentStart(e.implicit == 0)
+        elif e.kind == c.DOCUMENT_END_EVENT then
+            DocumentEnd(e.implicit == 0)
+        elif e.kind == c.ALIAS_EVENT then
+            Alias(text_at(e.anchor, start)?)
+        elif e.kind == c.SCALAR_EVENT then
+            Scalar(bytes_at(e.value, e.length, start)?, maybe_text(e.anchor, start)?,
+                   maybe_text(e.tag, start)?, scalar_style(e.style), e.implicit != 0,
+                   e.quoted_implicit != 0)
+        elif e.kind == c.SEQUENCE_START_EVENT then
+            SequenceStart(maybe_text(e.anchor, start)?, maybe_text(e.tag, start)?,
+                          collection_style(e.style, c.FLOW_SEQUENCE_STYLE), e.implicit != 0)
+        elif e.kind == c.SEQUENCE_END_EVENT then
+            SequenceEnd
+        elif e.kind == c.MAPPING_START_EVENT then
+            MappingStart(maybe_text(e.anchor, start)?, maybe_text(e.tag, start)?,
+                         collection_style(e.style, c.FLOW_MAPPING_STYLE), e.implicit != 0)
+        else
+            MappingEnd
+
+        Ok(Located(ev, start, fin))
+    end next
+
+    /** What libyaml says about the failure it has just reported. */
+    private failure(*self) -> Error
+        val r = self.raw()
+        val stage = stage_of(c.reader_error(r))
+
+        if stage == Memory then return OutOfMemory
+
+        val problem = message_at(c.reader_problem(r), "libyaml refused the document")
+        val context = if c.reader_context(r) == null then
+            None
+        else
+            Some(message_at(c.reader_context(r), ""))
+
+        Syntax(problem, Mark(c.reader_problem_line(r), c.reader_problem_column(r)), context,
+               Mark(c.reader_context_line(r), c.reader_context_column(r)), stage)
+    end failure
+end Parser
+
+// **`yaml_parser_delete`, through a copy of the storage, which is safe and worth saying why.** A
+// destructor takes `self` by value, so the address here is of a copy of the placed struct rather
+// than of the box's own — and what libyaml frees are the *pointer values* inside it, which a copy
+// carries unchanged. The box is being destroyed either way, so nothing reads the copy afterwards.
+impl Drop for Parser
+    drop(self)
+        var storage = self.storage
+
+        c.reader_done(ptr_cast(&storage[0]))
+
+/** A parser over `text`, or the reason libyaml could not make one.
+ *
+ * The text is not copied and not scanned here: nothing is read until `next` is called.
+ */
+parser(text: string) -> Result[&Parser, Error]
+    var p: &Parser = Parser(text, [0; c.READER_WORDS], false)
+    val b = p.src.bytes
+
+    if c.reader_init(p.raw(), as_ptr(b), b.len) == 0 then return Err(OutOfMemory)
+
+    Ok(p)
+end parser
+
+// ## Reading the pieces of an event
+//
+// Three small helpers, each of which exists because C's absence of a value and C's empty value are
+// the same pointer to nobody but the library that wrote it.
+
+/** A C string that is definitely there. */
+private text_at(p: *u8, at: Mark) -> Result[string, Error] =
+    from_cstring(p).map_err((_) -> NotUtf8(at))
+
+/** A C string that may be null, which is how libyaml says "no anchor" and "no tag". */
+private maybe_text(p: *u8, at: Mark) -> Result[Option[string], Error] =
+    if p == null then Ok(None) else Ok(Some(text_at(p, at)?))
+
+/** A scalar's bytes, which carry their own length: a YAML scalar may contain a NUL. */
+private bytes_at(p: *u8, n: usize, at: Mark) -> Result[string, Error] =
+    if n == 0 then Ok("") else from_utf8(p[0..<n]).map_err((_) -> NotUtf8(at))
+
+/** libyaml's own words, or a stand-in. Used where there is nothing to report the failure of. */
+private message_at(p: *u8, fallback: string) -> string =
+    if p == null then fallback else from_cstring(p).unwrap_or(fallback)
+
+private stage_of(code: i32) -> Stage =
+    if code == c.READER_ERROR then
+        Reader
+    elif code == c.SCANNER_ERROR then
+        Scanner
+    elif code == c.PARSER_ERROR then
+        Parser
+    elif code == c.COMPOSER_ERROR then
+        Composer
+    elif code == c.MEMORY_ERROR then
+        Memory
+    else
+        Unknown
+
+private scalar_style(code: i32) -> ScalarStyle =
+    if code == c.SINGLE_QUOTED_SCALAR_STYLE then
+        SingleQuoted
+    elif code == c.DOUBLE_QUOTED_SCALAR_STYLE then
+        DoubleQuoted
+    elif code == c.LITERAL_SCALAR_STYLE then
+        Literal
+    elif code == c.FOLDED_SCALAR_STYLE then
+        Folded
+    else
+        Plain
+
+private collection_style(code: i32, flow: i32) -> CollectionStyle =
+    if code == flow then Flow else Block

@@ -1,0 +1,113 @@
+module sh.sysl.yaml
+
+import sysl.buf.byte_sink
+import sysl.math.Float
+import sysl.text.from_utf8
+
+// What a `Value` looks like when a program prints one.
+//
+// **This is a rendering, not an emitter.** The card this package was written from left writing YAML
+// out, and nothing here fills that in: every string is double-quoted whether it needs to be, every
+// collection is written in flow style whatever the document did, and nothing is wrapped, indented or
+// folded. What it is for is `print(v)`, `s"${v}"` and the message an `assert_eq` prints when it
+// fails, which is a real need and a much smaller one.
+//
+// **It is valid YAML all the same**, because quoting everything and using flow style is the one
+// rendering that needs no decisions: a double-quoted scalar means its own text in every YAML there
+// has ever been. A caller that needs a document written properly — block style, chosen quoting, a
+// line width — wants an emitter, and should say so.
+
+impl Display for Value
+    display(self, out: *Writer, fmt: FormatSpec) = flow(self, out)
+
+private flow(v: Value, out: *Writer)
+    v match
+        Null -> out.write("null".bytes)
+        Bool(b) -> out.write(if b then "true".bytes else "false".bytes)
+        Int(n) -> out.write(str(n).bytes)
+        Real(x) -> out.write(real_text(x).bytes)
+        Str(s) -> quote(s, out)
+
+        Seq(items) ->
+            out.write("[".bytes)
+
+            for i in 0..<items.len()
+                if i > 0 then out.write(", ".bytes)
+
+                flow(items.at(i), out)
+
+            out.write("]".bytes)
+
+        Map(entries) ->
+            out.write("{".bytes)
+
+            for i in 0..<entries.len()
+                if i > 0 then out.write(", ".bytes)
+
+                val e = entries.at(i)
+
+                flow(e.key, out)
+                out.write(": ".bytes)
+                flow(e.value, out)
+
+            out.write("}".bytes)
+end flow
+
+// **YAML has a spelling for infinity and for not-a-number**, which is the one place this rendering
+// can say something JSON's cannot: `.inf`, `-.inf` and `.nan` read back as the values they name.
+private real_text(x: real) -> string
+    if x.is_nan() then return ".nan"
+
+    if !x.is_finite() then return if x > 0.0 then ".inf" else "-.inf"
+
+    var sink = byte_sink()
+
+    display_real_shortest(x, &sink, FormatSpec(0, -1, false))
+
+    with_point(from_utf8(sink.text()).unwrap())
+end real_text
+
+// `1` reads back as an integer and `1.0` does not, so a rendering with neither a point nor an
+// exponent in it gets one — which is what makes the rendering round-trip through `parse`.
+private with_point(t: string) -> string
+    val bs = t.bytes
+
+    for i in 0..<bs.len
+        if bs[i] == u8('.') || bs[i] == u8('e') || bs[i] == u8('E') then return t
+
+    t + ".0"
+end with_point
+
+private quote(s: string, out: *Writer)
+    out.write("\"".bytes)
+
+    val bs = s.bytes
+    var start: usize = 0
+
+    for i in 0..<bs.len
+        val rep = escape_of(bs[i])
+
+        if rep != ""
+            out.write(s[start..<i].bytes)
+            out.write(rep.bytes)
+            start = i + 1
+
+    out.write(s[start..].bytes)
+    out.write("\"".bytes)
+end quote
+
+// What one byte has to be written as, or the empty string where it may stand for itself. YAML's
+// double-quoted escapes are C's, plus `\x41` for a byte with no name of its own — the same shape as
+// JSON's `A` and two characters shorter.
+private escape_of(b: u8) -> string
+    if b == u8('"') then "\\\""
+    elif b == u8('\\') then "\\\\"
+    elif b == u8('\b') then "\\b"
+    elif b == u8('\f') then "\\f"
+    elif b == u8('\n') then "\\n"
+    elif b == u8('\r') then "\\r"
+    elif b == u8('\t') then "\\t"
+    elif b < 32 then "\\x" + hex_of(b >> 4) + hex_of(b & 15)
+    else ""
+
+private hex_of(n: u8) -> string = if n < 10 then str(n) else str(char(u8('a') + n - 10))

@@ -1,0 +1,530 @@
+module sh.sysl.yaml
+@tests
+
+import sh.sysl.yaml.c
+import sysl.buf.{Buf, buf}
+import sysl.math.Float
+
+// What this binding claims, run by `sysl test .`.
+//
+// **The conformance corpus is next door in `suite_tests.sysl` and does a different job.** It checks
+// that the *events* this binding produces are libyaml's, over 402 documents nobody here wrote. What
+// is checked here is everything above the events — the schema, the anchors, the budgets, the
+// destructor and the layout the C and the sysl have to agree about — none of which the corpus can
+// see, because it stops at the event stream.
+
+// -- The layout the two sides have to agree about ---------------------------------------------------
+
+// **A binding that disagrees with its C about a field's offset links perfectly and reads the wrong
+// bytes**, which is the failure mode a test has to be written for on purpose: nothing about it looks
+// like an error. `sizeof` on this side against `sizeof` on the other is the whole check, and it costs
+// a line.
+@test
+the_event_record_agrees_with_the_c() =
+    assert_eq(sizeof(c.Event), c.EVENT_SIZE, "sysl's Event is laid out as the shim's sysl_yaml_event")
+
+// The parser is placed in an array of `u64` **because that is 8-aligned by construction**, where an
+// array of bytes promises nothing. If libyaml ever wanted more than that, this is what says so.
+@test
+the_parser_wants_no_more_than_eight_byte_alignment() =
+    assert_eq(c.READER_ALIGN, usize(8), "a [N]u64 is aligned for libyaml's parser")
+
+    assert(c.READER_WORDS > 0, "and the size came from the header rather than from a guess")
+
+// -- The events, which is the tier under everything else --------------------------------------------
+
+// **The whole point of the event tier is that nothing has been decided yet**: an alias is an alias, a
+// scalar's style is the one the document wrote, and a tag is whatever text followed the `!`.
+@test
+events_arrive_with_what_the_document_wrote() =
+    val p = parser("--- !!map\nplain: &a text\nquoted: \"text\"\nsame: *a\n").expect("a parser")
+
+    var kinds: Buf[string] = buf()
+    var styles: Buf[ScalarStyle] = buf()
+    var anchors: Buf[string] = buf()
+    var aliases: Buf[string] = buf()
+    var tags: Buf[string] = buf()
+
+    loop
+        val l = p.next().expect("an event")
+
+        l.event match
+            StreamEnd -> break
+
+            DocumentStart(explicit) ->
+                kinds.push(if explicit then "doc ---" else "doc")
+
+            Scalar(_, anchor, tag, style, _, _) ->
+                styles.push(style)
+
+                anchor match
+                    Some(a) -> anchors.push(a)
+                    None -> ()
+
+                tag match
+                    Some(t) -> tags.push(t)
+                    None -> ()
+
+            Alias(name) -> aliases.push(name)
+
+            MappingStart(_, tag, _, _) ->
+                tag match
+                    Some(t) -> tags.push(t)
+                    None -> ()
+
+            _ -> ()
+
+    assert_eq(kinds.at(0), "doc ---", "the document opened explicitly")
+    assert_eq(anchors.len(), usize(1), "one anchor was written")
+    assert_eq(anchors.at(0), "a", "and it is called a")
+    assert_eq(aliases.len(), usize(1), "the alias is not resolved at this tier")
+    assert_eq(aliases.at(0), "a", "and it names the anchor")
+    assert_eq(tags.at(0), "tag:yaml.org,2002:map", "!!map is the resolved tag, not the shorthand")
+
+    // Five scalars: three keys and two values, since the third value is an alias rather than one.
+    assert_eq(styles.len(), usize(5), "every scalar arrived")
+    assert(styles.at(3) == DoubleQuoted, "and the quoted one says it was quoted")
+
+// A scalar may hold a NUL, which is why the shim carries a length beside the pointer rather than
+// handing over a C string. A binding that used `strlen` would truncate here and stay green on every
+// other test in this file.
+@test
+a_scalar_may_contain_a_nul_byte() =
+    val v = parse("s: \"a\\0b\"\n").expect("a document")
+
+    assert_eq(v.get("s").unwrap(), Str("a\0b"), "the NUL is in the middle of the string")
+
+// -- The core schema --------------------------------------------------------------------------------
+
+// **The 1.2 rule, which is the decision this package makes that a 1.1 tool makes differently.** Each
+// line is a document a person might write meaning one thing and a reader might take as another.
+@test
+a_plain_scalar_resolves_by_the_core_schema() =
+    val v = parse(raw"""
+        nothing:
+        tilde: ~
+        spelled: null
+        shouty: NULL
+        yes_word: yes
+        no_word: no
+        on_word: on
+        truth: true
+        untruth: False
+        count: 42
+        signed: -17
+        octal: 0o14
+        hex: 0xC
+        big: 9007199254740993
+        ratio: 0.5
+        exponent: 1e3
+        leading_dot: .5
+        trailing_dot: 5.
+        version: 1.2.3
+        empty_string: ""
+        quoted_null: "null"
+        quoted_number: "42"
+        """).expect("a document")
+
+    assert_eq(v.get("nothing").unwrap(), Null, "a key with nothing after it is null")
+    assert_eq(v.get("tilde").unwrap(), Null, "~ is null")
+    assert_eq(v.get("spelled").unwrap(), Null, "null is null")
+    assert_eq(v.get("shouty").unwrap(), Null, "NULL is null")
+
+    // The 1.1/1.2 difference, stated four times because it is the one that surprises people.
+    assert_eq(v.get("yes_word").unwrap(), Str("yes"), "yes is a string under the core schema")
+    assert_eq(v.get("no_word").unwrap(), Str("no"), "and so is no, which a 1.1 reader makes false")
+    assert_eq(v.get("on_word").unwrap(), Str("on"), "and on")
+
+    assert_eq(v.get("truth").unwrap(), Bool(true), "true is a boolean")
+    assert_eq(v.get("untruth").unwrap(), Bool(false), "and False is one, capitalised or not")
+
+    assert_eq(v.get("count").unwrap(), Int(42), "a run of digits is an integer")
+    assert_eq(v.get("signed").unwrap(), Int(-17), "with a sign if it has one")
+    assert_eq(v.get("octal").unwrap(), Int(12), "0o14 is twelve")
+    assert_eq(v.get("hex").unwrap(), Int(12), "0xC is twelve")
+    assert_eq(v.get("big").unwrap(), Int(9007199254740993), "an integer past 2^53 keeps every digit")
+
+    assert_eq(v.get("ratio").unwrap(), Real(0.5), "a fraction is a real")
+    assert_eq(v.get("exponent").unwrap(), Real(1000.0), "so is a number with an exponent")
+    assert_eq(v.get("leading_dot").unwrap(), Real(0.5), ".5 is a real")
+    assert_eq(v.get("trailing_dot").unwrap(), Real(5.0), "and 5. is one")
+
+    assert_eq(v.get("version").unwrap(), Str("1.2.3"), "two dots is not a number")
+    assert_eq(v.get("empty_string").unwrap(), Str(""), "an empty quoted scalar is the empty string")
+
+    // **Quoting is how a document says 'this is text'**, and a reader that ignored it would leave no
+    // way to write the string "null" at all.
+    assert_eq(v.get("quoted_null").unwrap(), Str("null"), "a quoted null is the four-letter string")
+    assert_eq(v.get("quoted_number").unwrap(), Str("42"), "and a quoted number is two characters")
+
+@test
+infinity_and_not_a_number_are_spelled() =
+    val v = parse("a: .inf\nb: -.Inf\nc: .nan\nd: .INF\n").expect("a document")
+
+    assert(v.get("a").unwrap().as_real().unwrap() == real.infinity(), ".inf is infinity")
+    assert(v.get("b").unwrap().as_real().unwrap() < 0.0, "-.Inf is negative")
+    assert(!v.get("b").unwrap().as_real().unwrap().is_finite(), "and it is an infinity")
+    assert(v.get("c").unwrap().as_real().unwrap().is_nan(), ".nan is not a number")
+    assert(!v.get("d").unwrap().as_real().unwrap().is_finite(), "and .INF is infinity too")
+
+// **A written tag wins over the schema**, which is the whole reason a document writes one.
+@test
+an_explicit_tag_decides_the_type() =
+    val v = parse(raw"""
+        digits: !!str 123
+        number: !!int "7"
+        floating: !!float "2.5"
+        flag: !!bool "true"
+        nothing: !!null "anything"
+        unknown: !Colour red
+        """).expect("a document")
+
+    assert_eq(v.get("digits").unwrap(), Str("123"), "!!str keeps the text")
+    assert_eq(v.get("number").unwrap(), Int(7), "!!int reads a quoted scalar as a number")
+    assert_eq(v.get("floating").unwrap(), Real(2.5), "!!float likewise")
+    assert_eq(v.get("flag").unwrap(), Bool(true), "and !!bool")
+    assert_eq(v.get("nothing").unwrap(), Null, "!!null is null whatever was written")
+
+    // A tag this package has never heard of leaves the text alone: there is nothing better to say
+    // about a type it does not know than what the document wrote.
+    assert_eq(v.get("unknown").unwrap(), Str("red"), "an unknown tag leaves the value as its text")
+
+// -- The shapes --------------------------------------------------------------------------------------
+
+@test
+a_mapping_keeps_the_order_it_was_written_in() =
+    val v = parse("b: 1\na: 2\nc: 3\n").expect("a document")
+
+    assert_eq(v.len(), usize(3), "three entries")
+    assert_eq(v.entry(0).unwrap().key, Str("b"), "b was written first")
+    assert_eq(v.entry(2).unwrap().key, Str("c"), "and c last")
+
+// **A YAML key may be any node**, which is the difference between this model and JSON's. A
+// string-keyed representation could not hold this document at all.
+@test
+a_key_may_be_a_sequence_or_a_number() =
+    val v = parse("? [a, b]\n: pair\n1: one\n").expect("a document")
+
+    assert_eq(v.entry(0).unwrap().key, seq_of([Str("a"), Str("b")]), "a sequence is a key")
+    assert_eq(v.entry(0).unwrap().value, Str("pair"), "and it has its value")
+    assert_eq(v.entry(1).unwrap().key, Int(1), "an unquoted 1 is an integer key, not a string one")
+    assert(v.get("1").is_none(), "so looking it up by the string 1 finds nothing")
+
+@test
+nested_collections_read_into_nested_values() =
+    val v = parse(raw"""
+        server:
+          ports:
+            - 80
+            - 443
+          tls:
+            enabled: true
+        """).expect("a document")
+
+    assert_eq(v.get("server").unwrap().get("ports").unwrap().at(1).unwrap(), Int(443), "the second port")
+    assert_eq(v.get("server").unwrap().get("tls").unwrap().get("enabled").unwrap(), Bool(true), "and the flag under it")
+
+@test
+flow_style_reads_the_same_as_block_style() =
+    val flow = parse("{a: [1, 2], b: {c: 3}}\n").expect("a document")
+    val block = parse("a:\n  - 1\n  - 2\nb:\n  c: 3\n").expect("a document")
+
+    assert_eq(flow, block, "the two documents say the same thing")
+
+// -- Anchors and aliases -----------------------------------------------------------------------------
+
+@test
+an_alias_reads_as_what_its_anchor_named() =
+    val v = parse(raw"""
+        defaults: &d
+          retries: 3
+          timeout: 30
+        staging: *d
+        """).expect("a document")
+
+    assert_eq(v.get("staging").unwrap(), v.get("defaults").unwrap(), "the alias is the anchored value")
+    assert_eq(v.get("staging").unwrap().get("retries").unwrap(), Int(3), "and it is a mapping, not a name")
+
+// **The nearest binding wins**, because a document may reuse an anchor name and an alias means the
+// most recent one.
+@test
+an_anchor_may_be_reused_and_the_nearest_one_wins() =
+    val v = parse("a: &x 1\nb: &x 2\nc: *x\n").expect("a document")
+
+    assert_eq(v.get("c").unwrap(), Int(2), "the second &x is what *x means")
+
+// An anchor does not reach across a `---`, which is what the spec says and what the loader's
+// per-document reset is for.
+@test
+an_anchor_does_not_cross_a_document_boundary() =
+    val e = parse_all("--- &a 1\n--- *a\n").expect_err("the second document cannot see the first's anchor")
+
+    e match
+        UnknownAlias(name, _) -> assert_eq(name, "a", "and it says which anchor")
+        _ -> assert(false, s"expected an unknown alias, got ${describe(e)}")
+
+// **A recursive document is refused rather than read**, which is the cost of resolving aliases into a
+// tree: `&a [*a]` names a value that contains itself, and there is no such `Value`. The anchor is
+// bound after its node is built, so the alias inside it finds nothing.
+@test
+a_self_referential_anchor_is_refused() =
+    val e = parse("&a [*a]\n").expect_err("a value cannot contain itself")
+
+    e match
+        UnknownAlias(_, _) -> ()
+        _ -> assert(false, s"expected an unknown alias, got ${describe(e)}")
+
+// -- The budgets ---------------------------------------------------------------------------------------
+
+// **The billion laughs, in YAML.** Each level names the one below it twice, so nine levels is 2^9
+// times the leaf — and the same shape with thirty levels is a machine that stops answering. The
+// budget is charged the *expanded* size, which is why this is refused rather than read cheaply into
+// shared storage.
+@test
+an_alias_bomb_is_refused_rather_than_expanded() =
+    val bomb = raw"""
+        a: &a [x, x, x, x, x, x, x, x, x, x]
+        b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]
+        c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]
+        d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c, *c]
+        e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d, *d]
+        f: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e, *e]
+        g: &g [*f, *f, *f, *f, *f, *f, *f, *f, *f, *f]
+        """
+
+    val e = parse(bomb).expect_err("a document naming ten million nodes is refused")
+
+    e match
+        TooLarge(limit) -> assert_eq(limit, usize(1000000), "at the limit the caller can see")
+        _ -> assert(false, s"expected a size refusal, got ${describe(e)}")
+
+    // **And the limit is the caller's**: the same document under a bigger budget is read.
+    val ok = parse_with(bomb, Limits(100000000, 1000)).expect("with room, it reads")
+
+    assert_eq(ok.get("g").unwrap().len(), usize(10), "ten entries at the top of the expansion")
+
+@test
+nesting_deeper_than_the_limit_is_refused() =
+    var text = ""
+
+    for _ in 0..<200
+        text = s"[${text}]"
+
+    val e = parse_with(text, Limits(1000000, 100)).expect_err("two hundred deep, with a hundred allowed")
+
+    e match
+        TooDeep(limit) -> assert_eq(limit, usize(100), "at the limit the caller set")
+        _ -> assert(false, s"expected a depth refusal, got ${describe(e)}")
+
+    assert(parse(text).is_ok(), "and the default limit is far past two hundred")
+
+// -- Documents -----------------------------------------------------------------------------------------
+
+@test
+a_stream_may_carry_several_documents() =
+    val docs = parse_all("--- a\n--- b\n--- c\n").expect("three documents")
+
+    assert_eq(docs.len(), usize(3), "three of them")
+    assert_eq(docs.at(2), Str("c"), "in the order they were written")
+
+// **A program expecting one configuration file hears about the second `---`** rather than silently
+// reading the first, which is the whole reason `parse` and `parse_all` are two functions.
+@test
+parse_refuses_a_stream_of_two_documents() =
+    val e = parse("--- a\n--- b\n").expect_err("two documents where one was wanted")
+
+    e match
+        NotOneDocument(n) -> assert_eq(n, usize(2), "and says how many there were")
+        _ -> assert(false, s"expected a document-count refusal, got ${describe(e)}")
+
+@test
+an_empty_stream_is_the_null_document() =
+    assert_eq(parse("").expect("an empty document"), Null, "nothing at all is null")
+    assert_eq(parse("# just a comment\n").expect("a comment"), Null, "and so is a file of comments")
+    assert_eq(parse("---\n").expect("an empty document"), Null, "and a --- with nothing after it")
+
+// A Kubernetes manifest is the reason this package exists, so one is read end to end.
+@test
+a_multi_document_manifest_reads() =
+    val docs = parse_all(raw"""
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: web
+        spec:
+          ports:
+            - port: 80
+              targetPort: 8080
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: web
+        spec:
+          replicas: 3
+        """).expect("two objects")
+
+    assert_eq(docs.len(), usize(2), "a service and a deployment")
+    assert_eq(docs.at(0).get("kind").unwrap(), Str("Service"), "the first is the service")
+    assert_eq(docs.at(0).get("spec").unwrap().get("ports").unwrap().at(0).unwrap().get("targetPort").unwrap(),
+              Int(8080), "and the port is a number four levels down")
+    assert_eq(docs.at(1).get("spec").unwrap().get("replicas").unwrap(), Int(3), "the second wants three")
+
+// **A `<<` merge key is an ordinary key here.** Folding it would make a key the caller can see
+// disappear into the mapping around it, and 1.2 dropped the feature. This test is what pins that
+// decision, so that turning it into a fold later is a change somebody makes on purpose.
+@test
+a_merge_key_is_not_folded() =
+    val v = parse(raw"""
+        base: &b
+          a: 1
+        derived:
+          <<: *b
+          c: 2
+        """).expect("a document")
+
+    val derived = v.get("derived").unwrap()
+
+    assert_eq(derived.len(), usize(2), "two entries: the merge key and c")
+    assert(derived.has("<<"), "the merge key is there to be seen")
+    assert(derived.get("a").is_none(), "and a has not been folded in")
+    assert_eq(derived.get("<<").unwrap().get("a").unwrap(), Int(1), "what it names is reachable")
+
+// -- Block scalars, which are why anybody uses YAML for a script ---------------------------------------
+
+@test
+literal_and_folded_blocks_keep_and_fold_their_newlines() =
+    val v = parse(raw"""
+        literal: |
+          line one
+          line two
+        folded: >
+          line one
+          line two
+        stripped: |-
+          no trailing newline
+        """).expect("a document")
+
+    assert_eq(v.get("literal").unwrap(), Str("line one\nline two\n"), "a literal block keeps its breaks")
+    assert_eq(v.get("folded").unwrap(), Str("line one line two\n"), "a folded block turns them into spaces")
+    assert_eq(v.get("stripped").unwrap(), Str("no trailing newline"), "and |- takes the last one away")
+
+// A block scalar is never resolved by the schema, whatever it says.
+@test
+a_block_scalar_is_always_a_string() =
+    val v = parse("n: |\n  42\n").expect("a document")
+
+    assert_eq(v.get("n").unwrap(), Str("42\n"), "a literal block holding digits is text")
+
+// -- What a failure says ---------------------------------------------------------------------------------
+
+// **The place is the half of a YAML error that matters**, and it is the half a binding can silently
+// lose: libyaml reports it on the parser rather than in the return value, so a binding that forgot to
+// ask would still produce a perfectly readable message about the wrong line.
+@test
+a_syntax_error_says_where_it_is() =
+    val e = parse("a: 1\nb: [1, 2\nc: 3\n").expect_err("an unclosed flow sequence")
+
+    e match
+        Syntax(problem, at, context, _, stage) ->
+            assert(problem != "", "libyaml's own words came through")
+            assert_eq(at.line, usize(2), "the third line, counting from zero")
+            assert(context.is_some(), "and what it was in the middle of")
+            assert(stage == Parser || stage == Scanner, "which stage refused")
+        _ -> assert(false, s"expected a syntax error, got ${describe(e)}")
+
+    assert(describe(parse("[").expect_err("unterminated")) != "", "and every error renders to something")
+
+@test
+a_tab_where_an_indent_belongs_is_refused() =
+    assert(parse("a:\n\t- 1\n").is_err(), "a tab cannot indent a block")
+
+// -- The rendering ----------------------------------------------------------------------------------------
+
+// `str(v)` exists for `print` and for what an `assert_eq` shows when it fails. It is flow style with
+// everything quoted, which is the one rendering that needs no decisions — and it reads back.
+@test
+a_value_renders_and_reads_back() =
+    val v = parse("a: [1, 2.5, true, null, \"x\"]\nb: {c: d}\n").expect("a document")
+
+    assert_eq(str(v), "{\"a\": [1, 2.5, true, null, \"x\"], \"b\": {\"c\": \"d\"}}", "the flow rendering")
+    assert_eq(parse(str(v)).expect("it is a document"), v, "and it reads back as what it was")
+
+@test
+the_rendering_escapes_what_it_must() =
+    val v = parse("a: \"tab\\there\"\nb: \"new\\nline\"\n").expect("a document")
+
+    assert_eq(str(v), "{\"a\": \"tab\\there\", \"b\": \"new\\nline\"}", "control characters are escaped")
+    assert_eq(parse(str(v)).expect("still a document").get("a").unwrap(), Str("tab\there"), "and read back")
+
+@test
+infinity_renders_as_yaml_spells_it() =
+    val v = parse("a: .inf\nb: .nan\n").expect("a document")
+
+    assert_eq(str(v), "{\"a\": .inf, \"b\": .nan}", "YAML has a spelling for both, where JSON has none")
+
+// -- The value's own members ---------------------------------------------------------------------------------
+
+@test
+the_accessors_never_convert() =
+    val v = parse("n: 1\nf: 1.5\ns: \"1\"\nb: true\n").expect("a document")
+
+    assert_eq(v.get("n").unwrap().as_int().unwrap(), 1, "an integer is an integer")
+    assert(v.get("s").unwrap().as_int().is_none(), "a string holding a digit is not")
+    assert(v.get("n").unwrap().as_str().is_none(), "and a number is not a string")
+    assert(v.get("b").unwrap().as_int().is_none(), "nor is a boolean")
+
+    // The one place the family does convert, because a caller asking for a real has said it does not
+    // care how the number was written.
+    assert_eq(v.get("n").unwrap().as_real().unwrap(), 1.0, "an integer widens to a real")
+    assert_eq(v.get("f").unwrap().as_real().unwrap(), 1.5, "and a real is one")
+
+@test
+reaching_into_the_wrong_shape_answers_none() =
+    val v = parse("a: 1\n").expect("a document")
+
+    assert(v.at(0).is_none(), "a mapping has no element at a position")
+    assert(v.get("a").unwrap().get("b").is_none(), "and a scalar has no member")
+    assert_eq(v.get("a").unwrap().len(), usize(0), "nor any length")
+    assert(v.get("missing").is_none(), "a key that is not there is not there")
+
+@test
+equality_is_about_two_documents_saying_the_same_thing() =
+    assert_eq(parse("a: 1\n").expect("one"), parse("a: 1\n").expect("two"), "the same text")
+    assert(parse("a: 1\n").expect("one") != parse("a: 1.0\n").expect("two"), "1 and 1.0 are different texts")
+    assert(parse("{a: 1, b: 2}").expect("one") != parse("{b: 2, a: 1}").expect("two"), "order is part of it")
+
+// -- The destructor ----------------------------------------------------------------------------------------
+
+// **A `Drop` runs when a box's count reaches zero and for nothing else**, so a constructor answering
+// an unboxed value would leak libyaml's parser on every call — about a kilobyte a time, silently, with
+// every test in this file still green. A thousand parsers made and dropped is what a leak would show
+// up in; what it asserts is that the run finishes at all and answers the same thing every time.
+@test
+a_parser_is_freed_when_it_goes() =
+    for _ in 0..<1000
+        val v = parse("a: [1, 2, 3]\n").expect("a document")
+
+        assert_eq(v.get("a").unwrap().len(), usize(3), "the same answer every time")
+
+// -- Unicode ------------------------------------------------------------------------------------------------
+
+@test
+a_document_may_be_in_any_language() =
+    val v = parse("greeting: 你好\nemoji: \"🙂\"\nkey with →: yes it is\n").expect("a document")
+
+    assert_eq(v.get("greeting").unwrap(), Str("你好"), "the bytes came through as characters")
+    assert_eq(v.get("emoji").unwrap(), Str("🙂"), "including one past the basic plane")
+    assert_eq(v.get("key with →").unwrap(), Str("yes it is"), "and a key may hold one")
+
+// The README shows a `for` over what `parse_all` answers, so this is what says the README compiles.
+// **A `Buf` is walked through `view()`**, which is the library's own road for reading one in bulk.
+@test
+the_documents_of_a_stream_are_iterable() =
+    var kinds: Buf[string] = buf()
+
+    for doc in parse_all("--- {kind: a}\n--- {kind: b}\n").expect("two documents").view()
+        kinds.push(doc.get("kind").unwrap().as_str().unwrap())
+
+    assert_eq(kinds.len(), usize(2), "both documents were walked")
+    assert_eq(kinds.at(1), "b", "in order")

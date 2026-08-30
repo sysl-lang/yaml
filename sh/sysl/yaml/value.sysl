@@ -1,0 +1,220 @@
+module sh.sysl.yaml
+
+import sysl.buf.{Buf, buf}
+
+// The value a document reads into, and the two things a caller does with one that a `match` does not
+// do well: ask what it is, and reach into it by name or by position.
+//
+// **The tree owns itself.** A sequence holds `Buf[Value]` and a mapping `Buf[Entry]` — no `&`
+// anywhere — so every walk over a document is a plain `match` on an ordinary value. That is
+// `sysl-lang/json`'s shape and `sysl-lang/toml`'s, deliberately: a program handed a configuration
+// file in whichever of the three formats it arrived in should not have to learn three idioms.
+//
+// **A mapping is a sequence of entries rather than a map, and its key is a `Value`.** Both are what
+// YAML is: a document keeps the order it was written in, and `[1, 2]: x` is a legal key that no
+// string-keyed representation can hold. `get` takes a `string` because that is what a caller almost
+// always has, and `entry` is there for the times it does not.
+
+/** One entry of a mapping. **Key and value are both `Value`s**, because a YAML key may be any node
+ * — a sequence, a mapping, or `null` — which is the difference between this and JSON.
+ */
+struct Entry
+    key: Value
+    value: Value
+
+/** A YAML value.
+ *
+ * **Numbers are two variants rather than one**, for `json`'s reason: carrying every number as a
+ * `real` loses the exact value of an integer past 2^53, where a timestamp in milliseconds lives, and
+ * carrying every number as a `long` cannot represent `0.5`. A plain scalar with no fraction and no
+ * exponent reads as `Int`; one with either reads as `Real`.
+ *
+ * **A timestamp is a `Str`.** The YAML 1.1 type repertoire had one and the 1.2 core schema does not,
+ * and a reader that resolved some strings into dates would be making a decision the document did not
+ * write down. `sysl.time` is what a caller reaches for once it knows which fields are dates.
+ */
+enum Value
+    Null
+    Bool(b: bool)
+    Int(n: long)
+    Real(x: real)
+    Str(s: string)
+    Seq(items: Buf[Value])
+    Map(entries: Buf[Entry])
+
+    /** Whether this is the null value — which is a value here, not the absence of one. `get` on a
+     * missing key answers `None`; `get` on one written `~` answers `Some(Null)`.
+     */
+    is_null(self) -> bool = self match
+        Null -> true
+        _ -> false
+
+    is_bool(self) -> bool = self.as_bool().is_some()
+
+    is_number(self) -> bool = self match
+        Int(_) -> true
+        Real(_) -> true
+        _ -> false
+
+    is_str(self) -> bool = self.as_str().is_some()
+
+    is_seq(self) -> bool = self match
+        Seq(_) -> true
+        _ -> false
+
+    is_map(self) -> bool = self match
+        Map(_) -> true
+        _ -> false
+
+    /** The boolean this is, or `None` for every other shape.
+     *
+     * The `as_*` family never converts and never coerces: a string reading `"true"` is a string, and
+     * `Str("1").as_int()` is `None`. What a document meant is the document's business.
+     */
+    as_bool(self) -> Option[bool] = self match
+        Bool(b) -> Some(b)
+        _ -> None
+
+    /** The integer this is. A `Real` is not one even where it holds a whole number, for the reason
+     * `Eq` gives: `1` and `1.0` are two different texts.
+     */
+    as_int(self) -> Option[long] = self match
+        Int(n) -> Some(n)
+        _ -> None
+
+    /** The number this is, as a `real`. **An `Int` widens**, which is the one place this family does
+     * convert — a caller asking for a `real` has said it does not care how the number was written.
+     */
+    as_real(self) -> Option[real] = self match
+        Real(x) -> Some(x)
+        Int(n) -> Some(real(n))
+        _ -> None
+
+    as_str(self) -> Option[string] = self match
+        Str(s) -> Some(s)
+        _ -> None
+
+    /** How many elements a sequence has, or how many entries a mapping has. Anything else is zero,
+     * which is what makes `for i in 0..<v.len()` safe against a value whose shape is unchecked.
+     */
+    len(self) -> usize = self match
+        Seq(items) -> items.len()
+        Map(entries) -> entries.len()
+        _ -> 0
+
+    /** The element at a position, for a sequence. `None` for an index past the end and `None` for a
+     * value that is not a sequence — the same answer on purpose, since a caller reaching into a
+     * document it did not write cannot usefully tell them apart.
+     */
+    at(self, i: usize) -> Option[Value] = self match
+        Seq(items) -> if i < items.len() then Some(items.at(i)) else None
+        _ -> None
+
+    /** The entry at a position, for a mapping — key and value together, in the order the document
+     * wrote them. This is how a mapping is walked when the keys are not known in advance, and the
+     * only way to reach an entry whose key is not a string.
+     */
+    entry(self, i: usize) -> Option[Entry] = self match
+        Map(entries) -> if i < entries.len() then Some(entries.at(i)) else None
+        _ -> None
+
+    /** The value written under a string key, or `None` where there is none.
+     *
+     * **The scan is linear and the first match wins.** YAML forbids a duplicate key and libyaml does
+     * not enforce it, so a document may still carry one; taking the first keeps this agreeing with
+     * what a caller walking the entries in order would find.
+     *
+     * **A `<<` merge key is an ordinary key here** and is not folded into the mapping — see the
+     * README. So `get("<<")` answers whatever the document wrote there.
+     */
+    get(self, key: string) -> Option[Value]
+        self match
+            Map(entries) ->
+                for i in 0..<entries.len()
+                    val e = entries.at(i)
+
+                    if e.key == Str(key) then return Some(e.value)
+
+                None
+            _ -> None
+    end get
+
+    /** Whether a mapping has this key, one written `null` included. */
+    has(self, key: string) -> bool = self.get(key).is_some()
+end Value
+
+/** Two entries are equal when they were written under equal keys and hold equal values. */
+impl Eq for Entry
+    eq(self, rhs: Entry) -> bool = self.key == rhs.key && self.value == rhs.value
+
+/** Two values are equal when they are the same shape holding equal things.
+ *
+ * **The two numeric variants do not meet**, so `Int(1)` and `Real(1.0)` are not equal: this equality
+ * is about two *documents* saying the same thing, and `1` and `1.0` are two different texts. A
+ * caller comparing numbers regardless of how they were written has `as_real` and the language's `==`.
+ *
+ * **Mappings compare in order**, for the same reason: what is held is the sequence the document
+ * wrote, and a reordering is a different text.
+ */
+impl Eq for Value
+    eq(self, rhs: Value) -> bool
+        self match
+            Null -> rhs.is_null()
+            Bool(a) -> rhs match
+                Bool(b) -> a == b
+                _ -> false
+            Int(a) -> rhs match
+                Int(b) -> a == b
+                _ -> false
+            Real(a) -> rhs match
+                Real(b) -> a == b
+                _ -> false
+            Str(a) -> rhs match
+                Str(b) -> a == b
+                _ -> false
+            Seq(a) -> rhs match
+                Seq(b) ->
+                    if a.len() != b.len() then return false
+
+                    for i in 0..<a.len()
+                        if a.at(i) != b.at(i) then return false
+
+                    true
+                _ -> false
+            Map(a) -> rhs match
+                Map(b) ->
+                    if a.len() != b.len() then return false
+
+                    for i in 0..<a.len()
+                        val x = a.at(i)
+                        val y = b.at(i)
+
+                        if x.key != y.key || x.value != y.value then return false
+
+                    true
+                _ -> false
+    end eq
+end Value
+
+/** An empty sequence, for building one. */
+seq_of(items: []const Value) -> Value
+    var b: Buf[Value] = buf()
+
+    for v in items
+        b.push(v)
+
+    Seq(b)
+end seq_of
+
+/** A mapping from entries written in order. */
+map_of(entries: []const Entry) -> Value
+    var b: Buf[Entry] = buf()
+
+    for e in entries
+        b.push(e)
+
+    Map(b)
+end map_of
+
+/** One entry with a string key, which is nearly every entry anybody writes. */
+entry_of(key: string, value: Value) -> Entry = Entry(Str(key), value)

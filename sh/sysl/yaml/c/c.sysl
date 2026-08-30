@@ -1,0 +1,147 @@
+// libyaml as C reaches it: the shim's entry points, the flattened event, and the numbers `yaml.h`
+// gives its enumerations.
+//
+// **Nothing here is meant to be called by a program.** An event is a record of raw pointers valid
+// only until the next call, a failure is an `int` that has to be turned into a sentence by four more
+// calls, and the parser is a run of `u64`s whose meaning belongs to libyaml. The module above this
+// one turns those into a `&Parser` with a destructor and `Value`s that own themselves, and is what
+// an application imports.
+//
+// The split keeps two jobs apart. This one has to be **faithful** — a signature that disagrees with
+// the C links perfectly and corrupts the call at run time, and nothing in this arrangement checks
+// one against the other, so every declaration below was read out of `shim.h` rather than remembered.
+// The other one has to be **pleasant**, which is a different question.
+//
+// **Most of libyaml needs no shim at all**, which is what a pull parser buys: there is no callback
+// anywhere, so nothing has to find its way back into sysl. What forced `c/shim.c` is the union
+// inside `yaml_event_t`, and it is the only thing in it.
+
+module sh.sysl.yaml.c
+
+// libyaml. Installed rather than vendored — it is a hosted C library every platform packages, and
+// `package.hocon`'s `pkg_config` block is what turns a missing one into a sentence at build time
+// rather than a link error naming `yaml_parser_initialize`.
+@link("yaml")
+
+@include("shim.h")
+
+// ## The sizes, asked for rather than written down
+//
+// `sizeof` for the target being built for is what a `c const` block measures, so this is right on a
+// machine whose pointers are a different width. The `+ 7) / 8` is words rather than bytes: an array
+// of `u64` is 8-aligned by construction, where a `[N]u8` promises nothing.
+
+c const
+    READER_WORDS: usize = "(sizeof(sysl_yaml_reader) + 7) / 8"
+
+    // For the tests, which assert that this file's `Event` agrees with the C's. A binding that
+    // disagrees about a field's offset links perfectly and reads the wrong bytes.
+    EVENT_SIZE:  usize = "sizeof(sysl_yaml_event)"
+    READER_ALIGN: usize = "_Alignof(sysl_yaml_reader)"
+
+// ## What an event is
+//
+// The union in `yaml_event_t`, flattened by the shim. Which fields mean anything is what `kind`
+// says; the three pointers are null where the event carries no anchor, no tag or no value, which is
+// how "absent" is told from "empty".
+//
+// **The layout is the C's, field for field**, and `EVENT_SIZE` above is what a test compares against
+// `sizeof(Event)` on this side. Four `i32`s then pointers is the same packing clang gives the C
+// struct, and asserting it is cheaper than trusting it.
+struct Event
+    kind: i32
+    style: i32
+    implicit: i32
+    quoted_implicit: i32
+    anchor: *u8
+    tag: *u8
+    value: *u8
+    length: usize
+    start_line: usize
+    start_column: usize
+    end_line: usize
+    end_column: usize
+
+// ## The enumerations
+//
+// Every one is an `enum` constant in `yaml.h` rather than a `#define`, and `c const` reads either.
+
+c const
+    NO_EVENT:             i32 = "YAML_NO_EVENT"
+    STREAM_START_EVENT:   i32 = "YAML_STREAM_START_EVENT"
+    STREAM_END_EVENT:     i32 = "YAML_STREAM_END_EVENT"
+    DOCUMENT_START_EVENT: i32 = "YAML_DOCUMENT_START_EVENT"
+    DOCUMENT_END_EVENT:   i32 = "YAML_DOCUMENT_END_EVENT"
+    ALIAS_EVENT:          i32 = "YAML_ALIAS_EVENT"
+    SCALAR_EVENT:         i32 = "YAML_SCALAR_EVENT"
+    SEQUENCE_START_EVENT: i32 = "YAML_SEQUENCE_START_EVENT"
+    SEQUENCE_END_EVENT:   i32 = "YAML_SEQUENCE_END_EVENT"
+    MAPPING_START_EVENT:  i32 = "YAML_MAPPING_START_EVENT"
+    MAPPING_END_EVENT:    i32 = "YAML_MAPPING_END_EVENT"
+
+    // How a scalar was written. It is a fact about the document rather than about the value: the
+    // same string can arrive plain, quoted, literal or folded, and only a plain one is a candidate
+    // for the schema's `null`, `true` and numbers.
+    ANY_SCALAR_STYLE:           i32 = "YAML_ANY_SCALAR_STYLE"
+    PLAIN_SCALAR_STYLE:         i32 = "YAML_PLAIN_SCALAR_STYLE"
+    SINGLE_QUOTED_SCALAR_STYLE: i32 = "YAML_SINGLE_QUOTED_SCALAR_STYLE"
+    DOUBLE_QUOTED_SCALAR_STYLE: i32 = "YAML_DOUBLE_QUOTED_SCALAR_STYLE"
+    LITERAL_SCALAR_STYLE:       i32 = "YAML_LITERAL_SCALAR_STYLE"
+    FOLDED_SCALAR_STYLE:        i32 = "YAML_FOLDED_SCALAR_STYLE"
+
+    // Block or flow, for a sequence and for a mapping. The two enumerations are separate in the
+    // header and their members happen to have the same numbers; they are both here because a
+    // binding that assumed that would be assuming it.
+    ANY_SEQUENCE_STYLE:   i32 = "YAML_ANY_SEQUENCE_STYLE"
+    BLOCK_SEQUENCE_STYLE: i32 = "YAML_BLOCK_SEQUENCE_STYLE"
+    FLOW_SEQUENCE_STYLE:  i32 = "YAML_FLOW_SEQUENCE_STYLE"
+
+    ANY_MAPPING_STYLE:   i32 = "YAML_ANY_MAPPING_STYLE"
+    BLOCK_MAPPING_STYLE: i32 = "YAML_BLOCK_MAPPING_STYLE"
+    FLOW_MAPPING_STYLE:  i32 = "YAML_FLOW_MAPPING_STYLE"
+
+    // Which stage of libyaml refused. The reader decodes bytes, the scanner makes tokens, the
+    // parser makes events; a document that is not UTF-8 fails in the first and a document with a
+    // bad indent in the third.
+    NO_ERROR:      i32 = "YAML_NO_ERROR"
+    MEMORY_ERROR:  i32 = "YAML_MEMORY_ERROR"
+    READER_ERROR:  i32 = "YAML_READER_ERROR"
+    SCANNER_ERROR: i32 = "YAML_SCANNER_ERROR"
+    PARSER_ERROR:  i32 = "YAML_PARSER_ERROR"
+    COMPOSER_ERROR: i32 = "YAML_COMPOSER_ERROR"
+
+// ## The reader
+//
+// `input` is not copied — libyaml reads out of the caller's bytes — so whatever owns them has to
+// outlive the reader. The module above holds the document's `string` in the same box as the storage,
+// which is what makes that true by construction.
+
+opaque struct Reader
+
+extern "sysl_yaml_reader_init" reader_init(r: *Reader, input: *u8, length: usize) -> i32
+
+// Nonzero for an event, zero for a failure. **The pointers written into `out` are good until the
+// next call**, because the event they point into is deleted by it.
+extern "sysl_yaml_reader_next" reader_next(r: *Reader, out: *Event) -> i32
+
+extern "sysl_yaml_reader_done" reader_done(r: *Reader)
+
+// ## What went wrong
+//
+// libyaml reports a failure as five separate pieces of state on the parser, and the shim publishes
+// each one rather than composing a message: the sentence a program shows is the sysl side's to make.
+
+extern "sysl_yaml_reader_error" reader_error(r: *Reader) -> i32
+
+// libyaml's own words, in static storage of its own, or null.
+extern "sysl_yaml_reader_problem" reader_problem(r: *Reader) -> *u8
+
+extern "sysl_yaml_reader_problem_line" reader_problem_line(r: *Reader) -> usize
+extern "sysl_yaml_reader_problem_column" reader_problem_column(r: *Reader) -> usize
+extern "sysl_yaml_reader_problem_offset" reader_problem_offset(r: *Reader) -> usize
+
+// What was being parsed when it failed — "while parsing a block mapping" — or null, and where that
+// began. It is the half of a YAML diagnostic that says where to look, as against what is wrong.
+extern "sysl_yaml_reader_context" reader_context(r: *Reader) -> *u8
+extern "sysl_yaml_reader_context_line" reader_context_line(r: *Reader) -> usize
+extern "sysl_yaml_reader_context_column" reader_context_column(r: *Reader) -> usize

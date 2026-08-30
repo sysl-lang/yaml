@@ -1,0 +1,59 @@
+// YAML, read into a sysl value, bound to libyaml.
+//
+// A document reads into a value that owns itself -- a mapping is a `Buf[Entry]` and a sequence a
+// `Buf[Value]`, with no reference anywhere -- so every walk over one is a plain `match`. That is
+// `sysl-lang/json`'s shape and `sysl-lang/toml`'s, deliberately: the three formats are read for the
+// same reason, and a program handed all three should not have to learn three idioms.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       yaml { git = "github.com/sysl-lang/yaml", version = "0.1.0" }
+//     }
+//
+// The coordinate names the package, `yaml`; the module a program imports is `sh.sysl.yaml`.
+
+package {
+  name    = "yaml"
+  version = "0.1.0"
+
+  // The oldest compiler this was written and tested against, rather than a bisected minimum. `c
+  // const` over `sizeof`, `opaque struct`, `@link` and `@include` are all much older than this.
+  sysl = "0.0.93"
+}
+
+// **`heap`, because a document's size is not known until it has been read.** A mapping is a
+// `Buf[Entry]`, a sequence a `Buf[Value]`, and every scalar is copied out of libyaml's storage into
+// a `string` that outlives the event. Nothing here can be given caller-supplied storage, because
+// nothing here knows how much to ask for.
+//
+// **`posix`, because libyaml is a hosted library.** It allocates, and its build assumes a C library.
+// Saying so turns "this cannot work there" into one refusal before anything is compiled.
+//
+// **What is NOT here is `os`.** This package neither opens nor reads a file: `parse` is given text
+// the caller already has. Where the document came from is the program's business.
+//
+// **THIS SHOULD BE A `pkg_config` BLOCK AND CANNOT BE ONE YET, WHICH IS CARD `0380`.** Nothing is
+// vendored — libyaml is a hosted C library with its own build system and every platform packages it
+// — so a consumer has to have it installed, and a `pkg_config` requirement is how every other
+// installed-library binding in the org says so once and builds with the bare command.
+//
+// libyaml files as **`yaml-0.1`**, and sysl refuses that name: a `pkg_config` key is checked by the
+// same rule as a `headers` name, which allows letters, digits, `_` and `-` and no dot. The name is
+// not this package's to choose — it is what `pkg-config` answers to, on macOS, Debian and Arch
+// alike — so until the card lands the requirement is declared as a header one and a build is handed
+// libyaml's two directories:
+//
+//     sysl test . --include-path yaml=$(pkg-config --variable=includedir yaml-0.1) \
+//                 --link-path $(pkg-config --variable=libdir yaml-0.1)
+//
+// When `0380` lands this becomes `pkg_config { "yaml-0.1" = ... }`, the flags go away, and the
+// package re-tags.
+requires {
+  heap  = true
+  posix = true
+
+  headers {
+    yaml = "libyaml — `brew install libyaml` on macOS, Debian's libyaml-dev, Arch's libyaml"
+  }
+}
