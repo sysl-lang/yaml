@@ -2,6 +2,8 @@
 
 YAML 1.2, read into a sysl value, bound to [libyaml](https://github.com/yaml/libyaml).
 
+*An independent sysl package for libyaml. It is not affiliated with or endorsed by libyaml's authors or trademark holders.*
+
 ```sysl
 import sh.sysl.yaml.{parse, describe}
 
